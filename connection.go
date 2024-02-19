@@ -31,6 +31,7 @@ import (
 )
 
 type MessageHandler func(data []byte) error
+type StateHandler func(state ConnectionState) error
 
 type ConnectionState int32
 
@@ -39,6 +40,7 @@ const (
 	ConnectionPending
 	Connected
 	Disconnecting
+	Disconnected
 )
 
 type AtomicConnectionState struct {
@@ -67,10 +69,11 @@ const (
 )
 
 type Connection interface {
-	ListenAndServe(ctx context.Context) error
+	ListenAndServe(ctx context.Context, callbackFn StateHandler) error
 	Read(ctx context.Context) ([]byte, error)
 	Write(ctx context.Context, data []byte) error
 	Close() error
+	IsConnected() bool
 }
 
 type connection struct {
@@ -149,7 +152,7 @@ func NewConnection(role ConnectionRole, opts ...OptionFunction) Connection {
 	return conn
 }
 
-func (c *connection) ListenAndServe(ctx context.Context) error {
+func (c *connection) ListenAndServe(ctx context.Context, callbackFn StateHandler) error {
 	host := "127.0.0.1:"
 	if c.role == ServerConnection {
 		host += fmt.Sprintf("%d", c.serverPort)
@@ -169,7 +172,7 @@ func (c *connection) ListenAndServe(ctx context.Context) error {
 		}
 	}
 
-	err = c.eventLoop(ctx)
+	err = c.eventLoop(ctx, callbackFn)
 	if err != nil {
 		return fmt.Errorf("server closed: %v", err)
 	}
@@ -333,7 +336,7 @@ func (c *connection) disconnect(ctx context.Context) error {
 	return nil
 }
 
-func (c *connection) eventLoop(ctx context.Context) error {
+func (c *connection) eventLoop(ctx context.Context, callbackFn StateHandler) error {
 	for {
 		select {
 		case <-c.done:
@@ -341,7 +344,7 @@ func (c *connection) eventLoop(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		default:
-			err := c.waitForNextMessage(ctx)
+			err := c.waitForNextMessage(ctx, callbackFn)
 			if err != nil {
 				return err
 			}
@@ -349,7 +352,7 @@ func (c *connection) eventLoop(ctx context.Context) error {
 	}
 }
 
-func (c *connection) waitForNextMessage(ctx context.Context) error {
+func (c *connection) waitForNextMessage(ctx context.Context, callbackFn StateHandler) error {
 	msg, addr, err := c.read(ctx)
 	if err != nil {
 		return fmt.Errorf("read failed: %v", err)
@@ -364,11 +367,13 @@ func (c *connection) waitForNextMessage(ctx context.Context) error {
 			c.peerAddress = addr
 			c.state.Set(Connected)
 			c.write(ctx, &Message{ID: uuid.NewString(), Type: Ack, Source: c.identifier}, c.peerAddress)
+			callbackFn(c.state.Get())
 		}
 	case Disconnect:
 		if addr.String() == c.peerAddress.String() {
 			c.peerAddress = nil
 			c.state.Set(NotConnected)
+			callbackFn(c.state.Get())
 		}
 	case Data:
 		if addr.String() == c.peerAddress.String() {
@@ -435,4 +440,8 @@ func (c *connection) write(ctx context.Context, msg *Message, netAddr net.Addr) 
 	}
 
 	return nil
+}
+
+func (c *connection) IsConnected() bool {
+	return c.state.Get() == Connected
 }

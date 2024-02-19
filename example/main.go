@@ -30,7 +30,10 @@ func main() {
 
 	server := ipc.NewConnection(ipc.ServerConnection)
 	go func() {
-		err := server.ListenAndServe(ctx)
+		err := server.ListenAndServe(ctx, func(state ipc.ConnectionState) error {
+			fmt.Println("server state changed:", state)
+			return nil
+		})
 		if err != nil {
 			fmt.Println("server error:", err)
 		}
@@ -42,7 +45,10 @@ func main() {
 		return nil
 	}))
 	go func() {
-		err := client.ListenAndServe(ctx)
+		err := client.ListenAndServe(ctx, func(state ipc.ConnectionState) error {
+			fmt.Println("server state changed:", state)
+			return nil
+		})
 		if err != nil {
 			fmt.Println("client error:", err)
 		}
