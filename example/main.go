@@ -28,7 +28,12 @@ func main() {
 	ctx, cancelFn := context.WithCancel(context.Background())
 	defer cancelFn()
 
-	server := ipc.NewConnection(ipc.ServerConnection)
+	server, err := ipc.NewConnection(ipc.ServerConnection)
+	if err != nil {
+		fmt.Println("failed to create server:", err)
+		return
+	}
+
 	go func() {
 		err := server.ListenAndServe(ctx, func(state ipc.ConnectionState) error {
 			fmt.Println("server state changed:", state)
@@ -40,10 +45,15 @@ func main() {
 		fmt.Println("server closed")
 	}()
 
-	client := ipc.NewConnection(ipc.ClientConnection, ipc.WithReadHandler(func(data []byte) error {
+	client, err := ipc.NewConnection(ipc.ClientConnection, ipc.WithReadHandler(func(data []byte) error {
 		fmt.Println("client received message:", string(data))
 		return nil
 	}))
+	if err != nil {
+		fmt.Println("failed to create client:", err)
+		return
+	}
+
 	go func() {
 		err := client.ListenAndServe(ctx, func(state ipc.ConnectionState) error {
 			fmt.Println("server state changed:", state)
@@ -57,7 +67,7 @@ func main() {
 
 	writeCtx, writeCancelFn := context.WithTimeout(ctx, time.Second)
 	defer writeCancelFn()
-	err := client.Write(writeCtx, []byte("Hello, world!"))
+	err = client.Write(writeCtx, []byte("Hello, world!"))
 	if err != nil {
 		fmt.Println("failed to write to server:", err)
 	}

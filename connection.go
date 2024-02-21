@@ -66,6 +66,12 @@ type ConnectionRole string
 const (
 	ClientConnection ConnectionRole = "client"
 	ServerConnection ConnectionRole = "server"
+
+	DefaultServerHost        = "127.0.0.1"
+	DefaultServerPort        = 33333
+	DefaultConnectionTimeout = time.Second * 60
+	DefaultReadTimeout       = time.Millisecond * 500
+	DefaultWriteTimeout      = time.Millisecond * 500
 )
 
 type Connection interface {
@@ -79,6 +85,7 @@ type Connection interface {
 type connection struct {
 	state             AtomicConnectionState
 	role              ConnectionRole
+	serverHost        string
 	serverPort        int
 	conn              *ipv4.PacketConn
 	identifier        string
@@ -94,6 +101,12 @@ type connection struct {
 }
 
 type OptionFunction func(*connection)
+
+func WithServerHost(host string) OptionFunction {
+	return func(c *connection) {
+		c.serverHost = host
+	}
+}
 
 func WithServerPort(port int) OptionFunction {
 	return func(c *connection) {
@@ -125,17 +138,18 @@ func WithReadHandler(handler MessageHandler) OptionFunction {
 	}
 }
 
-func NewConnection(role ConnectionRole, opts ...OptionFunction) Connection {
+func NewConnection(role ConnectionRole, opts ...OptionFunction) (Connection, error) {
 	conn := &connection{
 		state:             NewAtomicConnectionState(NotConnected),
 		role:              role,
-		serverPort:        33333,
+		serverHost:        DefaultServerHost,
+		serverPort:        DefaultServerPort,
 		identifier:        uuid.NewString(),
 		recv:              make(chan *Message),
 		done:              make(chan struct{}),
-		connectionTimeout: 60 * time.Second,
-		readTimeout:       time.Second,
-		writeTimeout:      time.Second,
+		connectionTimeout: DefaultConnectionTimeout,
+		readTimeout:       DefaultReadTimeout,
+		writeTimeout:      DefaultWriteTimeout,
 		peerAddress:       nil,
 		readLocker:        sync.Mutex{},
 		writeLocker:       sync.Mutex{},
@@ -145,15 +159,20 @@ func NewConnection(role ConnectionRole, opts ...OptionFunction) Connection {
 		opt(conn)
 	}
 
-	if conn.role == ClientConnection {
-		conn.peerAddress = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: conn.serverPort}
+	hostIP := net.ParseIP(conn.serverHost)
+	if hostIP == nil {
+		return nil, errors.New("failed to parse server host IP")
 	}
 
-	return conn
+	if conn.role == ClientConnection {
+		conn.peerAddress = &net.UDPAddr{IP: hostIP, Port: conn.serverPort}
+	}
+
+	return conn, nil
 }
 
 func (c *connection) ListenAndServe(ctx context.Context, callbackFn StateHandler) error {
-	host := "127.0.0.1:"
+	host := c.serverHost + ":"
 	if c.role == ServerConnection {
 		host += fmt.Sprintf("%d", c.serverPort)
 	}
@@ -166,7 +185,7 @@ func (c *connection) ListenAndServe(ctx context.Context, callbackFn StateHandler
 	defer c.conn.Close()
 
 	if c.role == ClientConnection {
-		err = c.connect(ctx)
+		err = c.connectClient()
 		if err != nil {
 			return fmt.Errorf("failed to connect: %v", err)
 		}
@@ -177,7 +196,7 @@ func (c *connection) ListenAndServe(ctx context.Context, callbackFn StateHandler
 		return fmt.Errorf("server closed: %v", err)
 	}
 
-	err = c.disconnect(ctx)
+	err = c.disconnect()
 	if err != nil {
 		return fmt.Errorf("failed to disconnect: %v", err)
 	}
@@ -187,7 +206,7 @@ func (c *connection) ListenAndServe(ctx context.Context, callbackFn StateHandler
 
 func (c *connection) Close() error {
 	if c.state.Get() == Connected {
-		close(c.done)
+		c.done <- struct{}{}
 	}
 	return nil
 }
@@ -242,7 +261,9 @@ func (c *connection) ensureConnected(ctx context.Context) error {
 	if c.state.Get() != Connected {
 		done := make(chan struct{})
 		go func() {
-			defer close(done)
+			defer func() {
+				done <- struct{}{}
+			}()
 
 			t := time.NewTimer(time.Millisecond * 10)
 			defer t.Stop()
@@ -272,55 +293,56 @@ func (c *connection) ensureConnected(ctx context.Context) error {
 	return nil
 }
 
-func (c *connection) connect(ctx context.Context) error {
+func (c *connection) connectClient() error {
+	outerCtx, outerCancelFn := context.WithCancelCause(context.Background())
+	defer outerCancelFn(nil)
+
+	ctx, ctxCancelFn := context.WithTimeout(outerCtx, c.connectionTimeout)
+	defer ctxCancelFn()
+
 	c.state.Set(ConnectionPending)
 
 	done := make(chan struct{})
-	quit := atomic.Bool{}
 	go func() {
-		defer close(done)
+		// signals that the connection is established
+		defer func() {
+			done <- struct{}{}
+		}()
+
 		for {
 			if ctx.Err() != nil {
 				return
 			}
-			if quit.Load() {
-				return
-			}
+
 			err := c.write(ctx, &Message{ID: uuid.NewString(), Type: Connect, Source: c.identifier}, c.peerAddress)
 			if err != nil {
-				continue
+				outerCancelFn(fmt.Errorf("write error: %v", err))
 			}
 
 			msg, addr, err := c.read(ctx)
 			if err != nil {
-				continue
+				outerCancelFn(fmt.Errorf("read error: %v", err))
 			}
+
 			if msg == nil {
 				continue
 			}
+
 			if msg.Type == Ack && addr.String() == c.peerAddress.String() {
 				c.state.Set(Connected)
 				return
 			}
-			time.Sleep(time.Millisecond * 100)
+
+			time.Sleep(time.Millisecond * 500)
 		}
 	}()
 
-	for {
-		select {
-		case <-ctx.Done():
-			quit.Store(true)
-			return fmt.Errorf("context cancelled")
-		case <-time.After(c.connectionTimeout):
-			quit.Store(true)
-			return fmt.Errorf("connection timeout")
-		case <-done:
-			return nil
-		}
-	}
+	<-done
+
+	return ctx.Err()
 }
 
-func (c *connection) disconnect(ctx context.Context) error {
+func (c *connection) disconnect() error {
 	if c.state.Get() != Connected {
 		c.state.Set(Disconnecting)
 		ctx, cancelFn := context.WithTimeout(context.Background(), c.writeTimeout)
@@ -378,6 +400,7 @@ func (c *connection) waitForNextMessage(ctx context.Context, callbackFn StateHan
 	case Data:
 		if addr.String() == c.peerAddress.String() {
 			if c.readHandler != nil {
+				//fmt.Fprintf(os.Stderr, "read handler: %s\n", string(msg.Data))
 				err = c.readHandler(msg.Data)
 				if err != nil {
 					return fmt.Errorf("failed to handle read: %v", err)
