@@ -206,6 +206,17 @@ func (c *connection) ListenAndServe(ctx context.Context, callbackFn StateHandler
 
 func (c *connection) Close() error {
 	if c.state.Get() == Connected {
+		outerCtx, outerCancelFn := context.WithCancelCause(context.Background())
+		defer outerCancelFn(nil)
+
+		ctx, cancelFn := context.WithTimeout(outerCtx, c.writeTimeout)
+		defer cancelFn()
+
+		err := c.write(ctx, &Message{ID: uuid.NewString(), Type: Disconnect, Source: c.identifier}, c.peerAddress)
+		if err != nil {
+			outerCancelFn(fmt.Errorf("write error: %v", err))
+		}
+
 		c.done <- struct{}{}
 	}
 	return nil
@@ -258,6 +269,7 @@ func (c *connection) ensureConnected(ctx context.Context) error {
 		return fmt.Errorf("context cancelled")
 	}
 
+	var err error
 	if c.state.Get() != Connected {
 		done := make(chan struct{})
 		go func() {
@@ -275,8 +287,10 @@ func (c *connection) ensureConnected(ctx context.Context) error {
 						return
 					}
 				case <-ctx.Done():
+					err = ctx.Err()
 					return
 				case <-time.After(c.connectionTimeout):
+					err = fmt.Errorf("connection timeout")
 					return
 				case <-c.done:
 					return
@@ -284,6 +298,10 @@ func (c *connection) ensureConnected(ctx context.Context) error {
 			}
 		}()
 		<-done
+	}
+
+	if err != nil {
+		return fmt.Errorf("failed to connect: %v", err)
 	}
 
 	if c.state.Get() != Connected {
@@ -385,12 +403,10 @@ func (c *connection) waitForNextMessage(ctx context.Context, callbackFn StateHan
 
 	switch msg.Type {
 	case Connect:
-		if c.state.Get() == NotConnected {
-			c.peerAddress = addr
-			c.state.Set(Connected)
-			c.write(ctx, &Message{ID: uuid.NewString(), Type: Ack, Source: c.identifier}, c.peerAddress)
-			callbackFn(c.state.Get())
-		}
+		c.peerAddress = addr
+		c.state.Set(Connected)
+		c.write(ctx, &Message{ID: uuid.NewString(), Type: Ack, Source: c.identifier}, c.peerAddress)
+		callbackFn(c.state.Get())
 	case Disconnect:
 		if addr.String() == c.peerAddress.String() {
 			c.peerAddress = nil
@@ -400,7 +416,6 @@ func (c *connection) waitForNextMessage(ctx context.Context, callbackFn StateHan
 	case Data:
 		if addr.String() == c.peerAddress.String() {
 			if c.readHandler != nil {
-				//fmt.Fprintf(os.Stderr, "read handler: %s\n", string(msg.Data))
 				err = c.readHandler(msg.Data)
 				if err != nil {
 					return fmt.Errorf("failed to handle read: %v", err)
